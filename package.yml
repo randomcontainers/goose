@@ -1,0 +1,202 @@
+name: goose
+title: goose (database migrations)
+summary: pressly/goose, the database migration tool. Applies, rolls back and checks SQL migrations for PostgreSQL, MySQL, SQLite, SQL Server and ClickHouse.
+homepage: https://pressly.github.io/goose/
+# goose (MIT) and the Go modules linked into it: MIT (pgx, the Azure SDK,
+# libsql-client-go, the code go-mssqldb keeps from swisscom), BSD-3-Clause (the
+# Go standard library, golang.org/x, go-mssqldb, the modernc.org modules),
+# Apache-2.0 (clickhouse-go, the YDB SDK, vertica-sql-go, gRPC, OpenTelemetry),
+# MPL-2.0 (go-sql-driver/mysql), BSD-2-Clause (pkg/browser), ISC
+# (coder/websocket), MIT-0 (segmentio/asm), and SQLite, which
+# modernc.org/sqlite translates to Go and whose authors dedicate it to the
+# public domain (blessing). The image carries the source zip of the MPL-2.0
+# module.
+license: MIT AND BSD-3-Clause AND Apache-2.0 AND MPL-2.0 AND BSD-2-Clause AND ISC AND MIT-0 AND blessing
+upstream:
+  source: github-release
+  repository: pressly/goose
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 3.29.0
+  # The release assets are prebuilt binaries, with no source tarball, so the
+  # build compiles the tag.
+  git:
+    url: https://github.com/pressly/goose.git
+    tag: v{version}
+    commit: 8b457ba3778983bec89012cd3bf6ab07a61ac0e4
+image:
+  entrypoint: [goose]
+  cmd: [--help]
+test:
+  - |
+    goose --version > version.txt
+    printf '%s\n' "goose version: v$VERSION" > version.want
+    cmp version.want version.txt || { echo "expected 'goose version: v$VERSION', got:" >&2; cat version.txt >&2; exit 1; }
+    # --help is not one of goose's flags, so Go's flag package prints the
+    # usage and exits with 0. The flag list goes to stderr.
+    goose --help > help.txt 2>&1 || { cat help.txt >&2; exit 1; }
+    grep -Fqx 'Usage: goose DRIVER DBSTRING [OPTIONS] COMMAND' help.txt || { cat help.txt >&2; exit 1; }
+    grep -Fqx '  -dir string' help.txt || { cat help.txt >&2; exit 1; }
+  - |
+    # beta drivers lists the database/sql drivers compiled in, several to a
+    # line for pgx and ydb ("pgx, pgx/v5").
+    goose beta drivers > drivers.txt
+    tr ',' ' ' < drivers.txt | tr -s ' ' '\n' > drivers.list
+    for driver in azuresql clickhouse libsql mysql pgx sqlite sqlserver vertica ydb; do
+      grep -Fqx "$driver" drivers.list || { echo "missing driver $driver:" >&2; cat drivers.txt >&2; exit 1; }
+    done
+    # Nothing listens on port 9, so each driver has to dial and fail.
+    refused() {
+      if goose "$1" "$2" version > refused.txt 2>&1; then
+        cat refused.txt >&2; echo "goose $1 found a server on port 9" >&2; exit 1
+      fi
+      grep -Fq 'connect: connection refused' refused.txt || { echo "goose $1:" >&2; cat refused.txt >&2; exit 1; }
+    }
+    refused postgres 'postgres://goose:secret@127.0.0.1:9/app?sslmode=disable'
+    refused mysql 'goose:secret@tcp(127.0.0.1:9)/app'
+    refused mssql 'sqlserver://goose:secret@127.0.0.1:9?database=app'
+    refused clickhouse 'clickhouse://127.0.0.1:9/app'
+  - |
+    mkdir lifecycle
+    cd lifecycle || exit 1
+    mkdir m
+    # With -s, create numbers the files in sequence; the new file holds goose's
+    # SQL template.
+    goose -dir m -s create create_users sql > create.log 2>&1 || { cat create.log >&2; exit 1; }
+    printf '%s\n' '-- +goose Up' "SELECT 'up SQL query';" '' '-- +goose Down' "SELECT 'down SQL query';" > template.want
+    cmp template.want m/00001_create_users.sql || { cat create.log >&2; ls m >&2; exit 1; }
+    cat > m/00001_create_users.sql <<'EOF'
+    -- +goose Up
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+    INSERT INTO users (name) VALUES ('ada'), ('grace');
+
+    -- +goose Down
+    DROP TABLE users;
+    EOF
+    goose -dir m -s create count_users sql > create.log 2>&1 || { cat create.log >&2; exit 1; }
+    # The CHECK constraint fails the migration unless users has two rows.
+    cat > m/00002_count_users.sql <<'EOF'
+    -- +goose Up
+    CREATE TABLE checks (n INTEGER NOT NULL CHECK (n = 2));
+    INSERT INTO checks SELECT count(*) FROM users;
+
+    -- +goose Down
+    DROP TABLE checks;
+    EOF
+    run() {
+      goose -dir m sqlite3 ./app.db "$@" > run.log 2>&1 || { echo "goose $*:" >&2; cat run.log >&2; exit 1; }
+    }
+    # goose logs through Go's log package, to stderr after a date and time.
+    expect() {
+      run version
+      sed -E 's|^[0-9/]+ [0-9:]+ ||' run.log > version.got
+      printf 'goose: version %s\n' "$1" > version.want
+      cmp version.want version.got || { echo "expected version $1, got:" >&2; cat run.log >&2; exit 1; }
+    }
+    run up
+    expect 2
+    run down
+    expect 1
+    run redo
+    expect 1
+    run reset
+    expect 0
+    run up-to 1
+    expect 1
+    run status
+    grep -Eq 'Pending +-- 00002_count_users\.sql$' run.log || { cat run.log >&2; exit 1; }
+    grep -E -- '-- 00001_create_users\.sql$' run.log > applied.txt || { cat run.log >&2; exit 1; }
+    if grep -Fq Pending applied.txt; then cat run.log >&2; exit 1; fi
+    run up
+    expect 2
+    # A migration that fails is rolled back as a whole, so t3 is not left
+    # behind and the fixed migration can create it.
+    printf '%s\n' '-- +goose Up' 'CREATE TABLE t3 (x INTEGER);' 'INSERT INTO missing VALUES (1);' > m/00003_t3.sql
+    if goose -dir m sqlite3 ./app.db up > broken.log 2>&1; then
+      cat broken.log >&2; echo "a failing migration was applied" >&2; exit 1
+    fi
+    grep -Fq 'ERROR 00003_t3.sql' broken.log || { cat broken.log >&2; exit 1; }
+    expect 2
+    printf '%s\n' '-- +goose Up' 'CREATE TABLE t3 (x INTEGER);' '' '-- +goose Down' 'DROP TABLE t3;' > m/00003_t3.sql
+    run up
+    expect 3
+  - |
+    mkdir envfile
+    cd envfile || exit 1
+    mkdir db
+    printf '%s\n' '-- +goose Up' 'CREATE TABLE t (x INTEGER);' '' '-- +goose Down' 'DROP TABLE t;' > db/00001_t.sql
+    # goose reads .env in the working directory unless -env=none is given.
+    printf '%s\n' 'GOOSE_DRIVER=sqlite3' 'GOOSE_DBSTRING=./env.db' 'GOOSE_MIGRATION_DIR=db' \
+      'GOOSE_TABLE=from_dotenv' > .env
+    goose env > env.txt
+    printf '%s\n' 'GOOSE_DRIVER="sqlite3"' 'GOOSE_DBSTRING="./env.db"' 'GOOSE_MIGRATION_DIR="db"' \
+      'GOOSE_TABLE="from_dotenv"' 'NO_COLOR="false"' > env.want
+    cmp env.want env.txt || { cat env.txt >&2; exit 1; }
+    goose up > up.log 2>&1 || { cat up.log >&2; exit 1; }
+    grep -Fq 'goose: successfully migrated database to version: 1' up.log || { cat up.log >&2; exit 1; }
+    test -s env.db || { echo "env.db was not written" >&2; exit 1; }
+    # A variable set in the environment wins over .env.
+    GOOSE_TABLE=schema_versions goose env > env.txt
+    grep -Fqx 'GOOSE_TABLE="schema_versions"' env.txt || { cat env.txt >&2; exit 1; }
+    if goose -env=none status > none.log 2>&1; then
+      cat none.log >&2; echo "goose ran without a driver" >&2; exit 1
+    fi
+    grep -Fqx 'Usage: goose DRIVER DBSTRING [OPTIONS] COMMAND' none.log || { cat none.log >&2; exit 1; }
+  - |
+    mkdir annotations
+    cd annotations || exit 1
+    mkdir m
+    # The trigger body has semicolons, so it goes between StatementBegin and
+    # StatementEnd. The CHECK constraint fails unless the trigger ran once.
+    cat > m/20261023120000_items.sql <<'EOF'
+    -- +goose Up
+    CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, edits INTEGER NOT NULL DEFAULT 0);
+    -- +goose StatementBegin
+    CREATE TRIGGER items_edit AFTER UPDATE OF name ON items
+    BEGIN
+      UPDATE items SET edits = edits + 1 WHERE id = NEW.id;
+    END;
+    -- +goose StatementEnd
+    INSERT INTO items (name) VALUES ('first');
+    UPDATE items SET name = 'second';
+    CREATE TABLE edits (n INTEGER NOT NULL CHECK (n = 1));
+    INSERT INTO edits SELECT edits FROM items;
+
+    -- +goose Down
+    DROP TABLE edits;
+    DROP TABLE items;
+    EOF
+    # ENVSUB ON replaces ${REGION} with the value from the environment.
+    cat > m/20261023120100_region.sql <<'EOF'
+    -- +goose ENVSUB ON
+    -- +goose Up
+    CREATE TABLE region (name TEXT NOT NULL CHECK (name = 'eu-west-1'));
+    INSERT INTO region VALUES ('${REGION}');
+
+    -- +goose Down
+    DROP TABLE region;
+    EOF
+    goose -dir m validate > validate.log 2>&1 || { cat validate.log >&2; exit 1; }
+    # fix renames timestamped migrations to sequential numbers.
+    goose -dir m fix > fix.log 2>&1 || { cat fix.log >&2; exit 1; }
+    ls m > files.txt
+    printf '%s\n' 00001_items.sql 00002_region.sql > files.want
+    cmp files.want files.txt || { cat fix.log files.txt >&2; exit 1; }
+    REGION=eu-west-1 goose -dir m sqlite3 ./app.db up > up.log 2>&1 || { cat up.log >&2; exit 1; }
+    grep -Fq 'goose: successfully migrated database to version: 2' up.log || { cat up.log >&2; exit 1; }
+    # validate rejects a file whose first section is Down.
+    printf '%s\n' '-- +goose Down' 'DROP TABLE items;' > m/00003_down_only.sql
+    if goose -dir m validate > invalid.log 2>&1; then
+      cat invalid.log >&2; echo "validate accepted a file without an Up section" >&2; exit 1
+    fi
+    grep -Fq 00003_down_only.sql invalid.log || { cat invalid.log >&2; exit 1; }
+examples:
+  - title: Apply the migrations in migrations/ to a PostgreSQL server on the host
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --network host -e GOOSE_DBSTRING ghcr.io/randomcontainers/goose -dir migrations postgres up
+  - title: Show which migrations are applied and which are pending
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --network host -e GOOSE_DBSTRING ghcr.io/randomcontainers/goose -dir migrations postgres status
+  - title: Create the next numbered SQL migration in migrations/
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/goose -dir migrations -s create add_users_table sql
+  - title: Check the migration files without a database
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/goose -dir migrations validate
