@@ -18,13 +18,13 @@ upstream:
   tag-pattern: '^v(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
-  version: 3.29.0
+  version: 3.30.0
   # The release assets are prebuilt binaries, with no source tarball, so the
   # build compiles the tag.
   git:
     url: https://github.com/pressly/goose.git
     tag: v{version}
-    commit: 8b457ba3778983bec89012cd3bf6ab07a61ac0e4
+    commit: 8ac452db43527fdcd0890b56986c9efdb3b7fd81
 image:
   entrypoint: [goose]
   cmd: [--help]
